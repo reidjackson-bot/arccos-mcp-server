@@ -1,10 +1,11 @@
 {
   "name": "arccos-mcp-server",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "login": "node login.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
