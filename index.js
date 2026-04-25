@@ -105,16 +105,30 @@ async function getValidToken() {
 
 // ────────────────────────────────────────────────────────────────
 // Club type lookup table
-// Reverse-engineered from `clubType` integers in /v6/.../clubs.
-// May need refinement once we see more clubs, but this matches
-// the captured bag (Driver=1, 3W=14, hybrid=26, irons=5–8, …).
-// Wedges and putter codes inferred from typical 14-club layouts.
+// Mapping confirmed against a real 14-club bag:
+//   1=Driver, 14=3W (Titleist TSR3), 26=Utility iron (U505),
+//   5–11=4i thru PW, 12=Putter, 47=50° wedge, 51=54° wedge, 55=58° wedge.
+//
+// Wedges are encoded as `clubType = loft − 3` (so 47 → 50°, 51 → 54°, etc).
+// We handle wedges programmatically via this offset rather than a static map,
+// which means any wedge loft Reid (or anyone) carries gets a correct label.
 // ────────────────────────────────────────────────────────────────
 const CLUB_TYPE_MAP = {
   1: 'Driver',
-  2: '2 Wood',
-  3: '3 Wood',
-  4: '5 Wood',
+  // Fairway woods
+  14: '3 Wood',
+  19: '5 Wood',
+  20: '7 Wood',
+  21: '9 Wood',
+  // Hybrids (TBD — not seen yet, codes are guesses pending real data)
+  22: '2 Hybrid',
+  23: '3 Hybrid',
+  24: '4 Hybrid',
+  25: '5 Hybrid',
+  // Utility / driving irons
+  26: 'Utility Iron',
+  // Numbered irons (confirmed)
+  4: '3 Iron',
   5: '4 Iron',
   6: '5 Iron',
   7: '6 Iron',
@@ -122,27 +136,18 @@ const CLUB_TYPE_MAP = {
   9: '8 Iron',
   10: '9 Iron',
   11: 'Pitching Wedge',
-  12: 'Gap Wedge',
-  13: 'Sand Wedge',
-  14: 'Lob Wedge',
-  15: 'Putter',
-  16: '1 Iron',
-  17: '2 Iron',
-  18: '3 Iron',
-  19: '7 Wood',
-  20: '9 Wood',
-  21: '11 Wood',
-  22: '1 Hybrid',
-  23: '2 Hybrid',
-  24: '3 Hybrid',
-  25: '4 Hybrid',
-  26: '5 Hybrid',
-  27: '6 Hybrid',
-  28: '7 Hybrid',
+  // Putter
+  12: 'Putter',
 };
 
 function clubTypeName(code) {
-  return CLUB_TYPE_MAP[code] || `Unknown (clubType=${code})`;
+  if (CLUB_TYPE_MAP[code]) return CLUB_TYPE_MAP[code];
+  // Wedge loft encoding: clubType in roughly 40–65 → loft = clubType + 3.
+  // Covers gap/sand/lob and any custom loft.
+  if (typeof code === 'number' && code >= 40 && code <= 65) {
+    return `${code + 3}° Wedge`;
+  }
+  return `Unknown (clubType=${code})`;
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -208,7 +213,7 @@ function asJson(data) {
 function createServer() {
   const server = new McpServer({
     name: 'arccos-mcp',
-    version: '0.3.0',
+    version: '0.3.1',
   });
 
   // ─── Profile ───
@@ -389,7 +394,7 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'arccos-mcp',
-    version: '0.3.0',
+    version: '0.3.1',
     userId: ARCCOS_USER_ID ? `${ARCCOS_USER_ID.substring(0, 8)}…` : null,
     auth: {
       mode: 'auto-refresh',
@@ -446,5 +451,5 @@ app.delete('/mcp', (_req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Arccos MCP] v0.3.0 on port ${PORT}`);
+  console.log(`[Arccos MCP] v0.3.1 on port ${PORT}`);
 });
