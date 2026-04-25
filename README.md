@@ -1,13 +1,29 @@
 # Arccos Golf MCP Server
 
-MCP server wrapping the public Arccos dashboard REST API.
-Reverse-engineered from `dashboard.arccosgolf.com` and `old.dashboard.arccosgolf.com`.
+MCP server wrapping the Arccos dashboard REST API.
+Reverse-engineered from `dashboard.arccosgolf.com`.
 
 ## Auth
 
-None. Arccos's dashboard API is unauthenticated and user-id-scoped.
-Set your user id via the `ARCCOS_USER_ID` environment variable.
-You can find your user id in any dashboard URL: `dashboard.arccosgolf.com/user/{userId}/...`
+Two-step token exchange, fully automated:
+
+1. **`accessKey` + `userId`** → `POST authentication.arccosgolf.com/tokens` → **JWT**
+2. **JWT** (3-hour lifetime) → `Authorization: Bearer: <jwt>` on all `api.arccosgolf.com` calls
+
+The server caches the JWT in memory and auto-refreshes ~60s before expiry, or on a 401 retry. The `accessKey` is long-lived (only rotates if you change your password or log out everywhere).
+
+### One-time setup: get your accessKey
+
+```bash
+ARCCOS_EMAIL=you@example.com ARCCOS_PASSWORD=yourpw npm run login
+```
+
+This prints your `userId` and `accessKey`. Set both as Railway env vars:
+
+- `ARCCOS_USER_ID`
+- `ARCCOS_ACCESS_KEY`
+
+Your password is **never stored** — it's only used in this one call to obtain the long-lived accessKey.
 
 ## Tools
 
@@ -26,23 +42,24 @@ You can find your user id in any dashboard URL: `dashboard.arccosgolf.com/user/{
 ## Endpoints
 
 - `POST /mcp` — MCP JSON-RPC over Streamable HTTP
-- `GET /health` — Health check
+- `GET /health` — Health check (includes cached token status)
 
 ## Deploy (Railway)
 
 1. Connect the repo to Railway.
-2. Set env var: `ARCCOS_USER_ID=<your_user_id>`.
+2. Set env vars: `ARCCOS_USER_ID` and `ARCCOS_ACCESS_KEY` (from `npm run login`).
 3. `PORT` is auto-injected.
 4. Build uses the included `Dockerfile`. No extra config needed.
 
 ## Local
 
 ```bash
-ARCCOS_USER_ID=<your_user_id> npm start
+ARCCOS_USER_ID=<id> ARCCOS_ACCESS_KEY=<key> npm start
 ```
 
 ## Notes
 
-- The Arccos API returns distances in **meters** in `/v6/.../clubs` and in **yards** (when `units=IMPERIAL`) in `/v4/.../smart-distances`.
-- `clubType` is an integer code — this server enriches `arccos_get_clubs` responses with a `clubTypeName` field. The mapping is best-effort; if a code maps to "Unknown", file an issue with the `clubType` value and the actual club it represents.
-- `arccos_get_club_distances` returns `clubId` only; join with `arccos_get_clubs` to get the human-readable club name.
+- `/v6/.../clubs` returns distances in **meters**; `/v4/.../smart-distances` returns yards (when `units=IMPERIAL`) or meters.
+- `clubType` is an integer code — this server enriches `arccos_get_clubs` responses with a `clubTypeName` field. The mapping is best-effort; if a code maps to "Unknown", file an issue with the code value and the actual club it represents.
+- `arccos_get_club_distances` returns `clubId` only; join with `arccos_get_clubs` to get the human-readable name.
+- The Authorization wire format is literally `Bearer: <jwt>` (with a colon). This is non-standard but matches what Arccos expects — replicating verbatim.
