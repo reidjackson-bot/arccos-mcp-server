@@ -3,19 +3,24 @@
 // Arccos Golf MCP Server
 // Wraps the Arccos dashboard REST API (api.arccosgolf.com).
 //
-// Auth: requires a JWT in the `Authorization: Bearer <jwt>` header.
-//   - Set ARCCOS_JWT env var to a valid token (lifetime ~3 hours).
-//   - Token can be grabbed from any api.arccosgolf.com request in the
-//     dashboard.arccosgolf.com Network tab → Request Headers → authorization.
-//   - Format in the wire is `Bearer: <jwt>` (note the colon, that's how
-//     Arccos sends it). We replicate that quirk verbatim.
+// Auth: two-step token exchange, fully automated.
+//   1. accessKey + userId → POST authentication.arccosgolf.com/tokens → JWT
+//   2. JWT (3-hour lifetime) used as `Authorization: Bearer: <jwt>` on api calls
 //
-// Refresh flow is TODO — once captured, this server will auto-refresh.
+// Server caches the JWT in memory and auto-refreshes ~60s before expiry,
+// or on 401 from the API. The accessKey is long-lived (does not rotate
+// unless the user explicitly logs out everywhere or changes password).
+//
+// To get an accessKey, run `npm run login` (or call POST /accessKeys with
+// email + password directly). Once obtained, set ARCCOS_ACCESS_KEY in env.
+//
+// Env vars:
+//   ARCCOS_USER_ID    — your user id (visible in dashboard URL path)
+//   ARCCOS_ACCESS_KEY — long-lived 40-char hex from /accessKeys login
 //
 // Endpoints reverse-engineered from:
-//   - old.dashboard.arccosgolf.com
-//   - dashboard.arccosgolf.com (new dashboard)
-//   - dashboard.arccosgolf.com/user/{userId}/clubs/all/distances/smart
+//   - dashboard.arccosgolf.com (auth flow)
+//   - old.dashboard.arccosgolf.com (REST data flow)
 
 import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -24,20 +29,25 @@ import { z } from 'zod';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const ARCCOS_USER_ID = process.env.ARCCOS_USER_ID;
-const ARCCOS_JWT = process.env.ARCCOS_JWT;
+const ARCCOS_ACCESS_KEY = process.env.ARCCOS_ACCESS_KEY;
 const ARCCOS_API_BASE = 'https://api.arccosgolf.com';
+const ARCCOS_AUTH_BASE = 'https://authentication.arccosgolf.com';
 
 if (!ARCCOS_USER_ID) {
   console.error('Missing ARCCOS_USER_ID environment variable');
   process.exit(1);
 }
-if (!ARCCOS_JWT) {
-  console.error('Missing ARCCOS_JWT environment variable');
-  console.error('Grab a fresh JWT from dashboard.arccosgolf.com Network tab → any api.arccosgolf.com request → Request Headers → authorization (drop the "Bearer: " prefix).');
+if (!ARCCOS_ACCESS_KEY) {
+  console.error('Missing ARCCOS_ACCESS_KEY environment variable');
+  console.error('To get one: POST https://authentication.arccosgolf.com/accessKeys with {email, password, signedInByFacebook:"F"}');
   process.exit(1);
 }
 
-// Decode the JWT exp claim so we can warn when it's about to expire.
+// ────────────────────────────────────────────────────────────────
+// Token cache + refresh
+// ────────────────────────────────────────────────────────────────
+let cachedToken = null; // { jwt, expiresAt: Date }
+
 function jwtExpiry(jwt) {
   try {
     const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64').toString());
@@ -46,13 +56,51 @@ function jwtExpiry(jwt) {
     return null;
   }
 }
-const tokenExp = jwtExpiry(ARCCOS_JWT);
-if (tokenExp) {
-  const minsLeft = Math.round((tokenExp - new Date()) / 60000);
-  console.log(`[Arccos MCP] JWT expires ${tokenExp.toISOString()} (${minsLeft} min from now)`);
-  if (minsLeft < 0) {
-    console.error('[Arccos MCP] WARNING: JWT is already expired. API calls will fail.');
+
+async function fetchFreshToken() {
+  const response = await fetch(`${ARCCOS_AUTH_BASE}/tokens`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json;charset=utf-8',
+      'Origin': 'https://dashboard.arccosgolf.com',
+      'Referer': 'https://dashboard.arccosgolf.com/',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+    },
+    body: JSON.stringify({
+      accessKey: ARCCOS_ACCESS_KEY,
+      userId: ARCCOS_USER_ID,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Token refresh failed (${response.status}): ${text.substring(0, 500)}`);
   }
+
+  const data = await response.json();
+  // Response shape: { token: "<jwt>", ... } — exact field name confirmed empirically.
+  // We accept a few common shapes defensively in case Arccos varies the field.
+  const jwt = data.token || data.access_token || data.accessToken || data.jwt;
+  if (!jwt) {
+    throw new Error(`Token refresh response missing JWT field. Got keys: ${Object.keys(data).join(', ')}`);
+  }
+
+  const expiresAt = jwtExpiry(jwt) || new Date(Date.now() + 60 * 60 * 1000); // fall back to 1hr
+  cachedToken = { jwt, expiresAt };
+  console.log(`[Arccos MCP] Refreshed JWT. Expires ${expiresAt.toISOString()}.`);
+  return cachedToken;
+}
+
+async function getValidToken() {
+  const REFRESH_THRESHOLD_MS = 60 * 1000; // refresh if <60s left
+  if (
+    cachedToken &&
+    cachedToken.expiresAt.getTime() - Date.now() > REFRESH_THRESHOLD_MS
+  ) {
+    return cachedToken;
+  }
+  return fetchFreshToken();
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -98,9 +146,8 @@ function clubTypeName(code) {
 }
 
 // ────────────────────────────────────────────────────────────────
-// HTTP helper — adds a small set of headers that match the dashboard
-// origin pattern. Arccos doesn't enforce these but we mirror them
-// for stability in case they start checking referer/origin.
+// HTTP helper — auto-refreshes the JWT, retries once on 401.
+// Mirrors dashboard headers for stability.
 // ────────────────────────────────────────────────────────────────
 async function arccosGet(path, queryParams = {}) {
   const url = new URL(ARCCOS_API_BASE + path);
@@ -108,19 +155,33 @@ async function arccosGet(path, queryParams = {}) {
     if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
   }
 
-  const response = await fetch(url.toString(), {
-    method: 'GET',
-    headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json;charset=utf-8',
-      // Arccos's wire format is literally `Bearer: <jwt>` with a colon. Verified
-      // from the dashboard.arccosgolf.com network capture; replicating verbatim.
-      'Authorization': `Bearer: ${ARCCOS_JWT}`,
-      'Origin': 'https://dashboard.arccosgolf.com',
-      'Referer': 'https://dashboard.arccosgolf.com/',
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
-    },
-  });
+  async function attempt(token) {
+    return fetch(url.toString(), {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json;charset=utf-8',
+        // Wire format is literally `Bearer: <jwt>` (with colon) — verified from
+        // dashboard.arccosgolf.com network capture. Replicating verbatim.
+        'Authorization': `Bearer: ${token.jwt}`,
+        'Origin': 'https://dashboard.arccosgolf.com',
+        'Referer': 'https://dashboard.arccosgolf.com/',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+      },
+    });
+  }
+
+  let token = await getValidToken();
+  let response = await attempt(token);
+
+  // If we get 401 anyway (e.g. server-side rotation, clock skew), force a
+  // refresh and retry once. Never loop more than once.
+  if (response.status === 401) {
+    console.log('[Arccos MCP] Got 401, forcing token refresh and retrying.');
+    cachedToken = null;
+    token = await getValidToken();
+    response = await attempt(token);
+  }
 
   if (!response.ok) {
     const text = await response.text();
@@ -147,7 +208,7 @@ function asJson(data) {
 function createServer() {
   const server = new McpServer({
     name: 'arccos-mcp',
-    version: '0.2.0',
+    version: '0.3.0',
   });
 
   // ─── Profile ───
@@ -325,17 +386,18 @@ const app = express();
 app.use(express.json());
 
 app.get('/health', (_req, res) => {
-  const exp = jwtExpiry(ARCCOS_JWT);
-  const minsLeft = exp ? Math.round((exp - new Date()) / 60000) : null;
   res.json({
     status: 'ok',
     service: 'arccos-mcp',
-    version: '0.2.0',
+    version: '0.3.0',
     userId: ARCCOS_USER_ID ? `${ARCCOS_USER_ID.substring(0, 8)}…` : null,
-    jwt: {
-      expiresAt: exp ? exp.toISOString() : null,
-      minutesUntilExpiry: minsLeft,
-      expired: minsLeft !== null && minsLeft < 0,
+    auth: {
+      mode: 'auto-refresh',
+      hasCachedToken: cachedToken !== null,
+      tokenExpiresAt: cachedToken ? cachedToken.expiresAt.toISOString() : null,
+      minutesUntilExpiry: cachedToken
+        ? Math.round((cachedToken.expiresAt - new Date()) / 60000)
+        : null,
     },
     timestamp: new Date().toISOString(),
   });
@@ -384,5 +446,5 @@ app.delete('/mcp', (_req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Arccos MCP] v0.2.0 on port ${PORT}`);
+  console.log(`[Arccos MCP] v0.3.0 on port ${PORT}`);
 });
