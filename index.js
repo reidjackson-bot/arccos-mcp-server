@@ -1,8 +1,16 @@
 // File: index.js
 //
 // Arccos Golf MCP Server
-// Wraps the public Arccos dashboard REST API (api.arccosgolf.com).
-// No auth required — endpoints are user-id-scoped and unauthenticated.
+// Wraps the Arccos dashboard REST API (api.arccosgolf.com).
+//
+// Auth: requires a JWT in the `Authorization: Bearer <jwt>` header.
+//   - Set ARCCOS_JWT env var to a valid token (lifetime ~3 hours).
+//   - Token can be grabbed from any api.arccosgolf.com request in the
+//     dashboard.arccosgolf.com Network tab → Request Headers → authorization.
+//   - Format in the wire is `Bearer: <jwt>` (note the colon, that's how
+//     Arccos sends it). We replicate that quirk verbatim.
+//
+// Refresh flow is TODO — once captured, this server will auto-refresh.
 //
 // Endpoints reverse-engineered from:
 //   - old.dashboard.arccosgolf.com
@@ -16,11 +24,35 @@ import { z } from 'zod';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const ARCCOS_USER_ID = process.env.ARCCOS_USER_ID;
+const ARCCOS_JWT = process.env.ARCCOS_JWT;
 const ARCCOS_API_BASE = 'https://api.arccosgolf.com';
 
 if (!ARCCOS_USER_ID) {
   console.error('Missing ARCCOS_USER_ID environment variable');
   process.exit(1);
+}
+if (!ARCCOS_JWT) {
+  console.error('Missing ARCCOS_JWT environment variable');
+  console.error('Grab a fresh JWT from dashboard.arccosgolf.com Network tab → any api.arccosgolf.com request → Request Headers → authorization (drop the "Bearer: " prefix).');
+  process.exit(1);
+}
+
+// Decode the JWT exp claim so we can warn when it's about to expire.
+function jwtExpiry(jwt) {
+  try {
+    const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64').toString());
+    return payload.exp ? new Date(payload.exp * 1000) : null;
+  } catch (_e) {
+    return null;
+  }
+}
+const tokenExp = jwtExpiry(ARCCOS_JWT);
+if (tokenExp) {
+  const minsLeft = Math.round((tokenExp - new Date()) / 60000);
+  console.log(`[Arccos MCP] JWT expires ${tokenExp.toISOString()} (${minsLeft} min from now)`);
+  if (minsLeft < 0) {
+    console.error('[Arccos MCP] WARNING: JWT is already expired. API calls will fail.');
+  }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -81,6 +113,9 @@ async function arccosGet(path, queryParams = {}) {
     headers: {
       'Accept': 'application/json',
       'Content-Type': 'application/json;charset=utf-8',
+      // Arccos's wire format is literally `Bearer: <jwt>` with a colon. Verified
+      // from the dashboard.arccosgolf.com network capture; replicating verbatim.
+      'Authorization': `Bearer: ${ARCCOS_JWT}`,
       'Origin': 'https://dashboard.arccosgolf.com',
       'Referer': 'https://dashboard.arccosgolf.com/',
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
@@ -112,7 +147,7 @@ function asJson(data) {
 function createServer() {
   const server = new McpServer({
     name: 'arccos-mcp',
-    version: '0.1.0',
+    version: '0.2.0',
   });
 
   // ─── Profile ───
@@ -290,11 +325,18 @@ const app = express();
 app.use(express.json());
 
 app.get('/health', (_req, res) => {
+  const exp = jwtExpiry(ARCCOS_JWT);
+  const minsLeft = exp ? Math.round((exp - new Date()) / 60000) : null;
   res.json({
     status: 'ok',
     service: 'arccos-mcp',
-    version: '0.1.0',
+    version: '0.2.0',
     userId: ARCCOS_USER_ID ? `${ARCCOS_USER_ID.substring(0, 8)}…` : null,
+    jwt: {
+      expiresAt: exp ? exp.toISOString() : null,
+      minutesUntilExpiry: minsLeft,
+      expired: minsLeft !== null && minsLeft < 0,
+    },
     timestamp: new Date().toISOString(),
   });
 });
@@ -342,5 +384,5 @@ app.delete('/mcp', (_req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Arccos MCP] v0.1.0 on port ${PORT}`);
+  console.log(`[Arccos MCP] v0.2.0 on port ${PORT}`);
 });
